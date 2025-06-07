@@ -2,6 +2,7 @@
 import argparse
 import sys
 import asyncio
+from typing import List, Any
 from urllib.parse import urlencode
 from loguru import logger
 
@@ -9,10 +10,10 @@ from rich.console import Console
 from rich.table import Table
 
 try:
-    from pip_search.pip_search import Config, search
+    from pip_search.pip_search import Config, search, Package
 except (ModuleNotFoundError, ImportError) as e:
     # logger.warning(f"pip_search module not found: {e} {type(e)}")
-    from pip_search import Config, search
+    from pip_search import Config, search, Package
 try:
     from . import __version__
 except (ModuleNotFoundError, ImportError) as e:
@@ -25,7 +26,14 @@ except (ModuleNotFoundError, ImportError) as e:
     from utils import check_version, check_local_libs, get_args
 
 
-def text_output(result, query, args):
+def text_output(result: List[Package], query: str, args: argparse.Namespace) -> None:
+    """Output search results as plain text.
+
+    Args:
+        result: List of Package objects
+        query: Search query
+        args: Command-line arguments
+    """
     for package in result:
         if package.info_set:
             print(f'{package.name} l:{package.link} ver:{package.version} rel:{package.released_date_str(args.date_format)} gh:{package.github_link} s:{package.stars} f:{package.forks} w:{package.watchers}')
@@ -33,7 +41,15 @@ def text_output(result, query, args):
             print(f'{package.name} l:{package.link} ver:{package.version} rel:{package.released_date_str(args.date_format)}')
         print(f'\tdescription: {package.description}')
 
-def table_output(result, query, args, config):
+def table_output(result: List[Package], query: str, args: argparse.Namespace, config: Config) -> None:
+    """Output search results as a formatted table.
+
+    Args:
+        result: List of Package objects
+        query: Search query
+        args: Command-line arguments
+        config: Configuration object
+    """
     table = Table(title=(f"[not italic]:snake:[/] [bold][magenta] {config.api_url}?{urlencode({'q': query})} [/] [not italic]:snake:[/]"))
     table.add_column("Package", style="cyan", no_wrap=True)
     table.add_column("Version", style="bold yellow")
@@ -62,12 +78,17 @@ def table_output(result, query, args, config):
     console = Console()
     console.print(table)
 
-async def async_main():
+async def async_main() -> int:
+    """Main async entry point.
+
+    Returns:
+        Exit code (0 for success, non-zero for error)
+    """
     config = Config()
     ap, args = get_args()
     if args.locallibs:
         print(f'checking local libs in {args.locallibs}')
-        outdated_libs,error_list = await check_local_libs(args.locallibs, args, config)
+        outdated_libs, error_list = await check_local_libs(args.locallibs, args, config)
         print(f'outdated libs: {len(outdated_libs)} errors: {len(error_list)} \n')
         print(f'\noutdated libs: {outdated_libs}\n')
         print(f'\nerrors: {error_list}\n')
@@ -105,7 +126,12 @@ async def async_main():
     table_output(res, query, args, config)
     return 0
 
-def main():
+def main() -> int:
+    """Main entry point.
+
+    Returns:
+        Exit code (0 for success, non-zero for error)
+    """
     return asyncio.run(async_main())
 
 if __name__ == "__main__":

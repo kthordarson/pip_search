@@ -2,12 +2,12 @@ import asyncio
 import re
 import string
 import hashlib
-from typing import Union, Tuple, List, Dict, Any
+from typing import Union, Tuple, List, Dict, Any, Optional, Sequence
 import argparse
 import glob
 import os
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from loguru import logger
 
 try:
@@ -29,7 +29,7 @@ def check_version(package_name: str) -> Union[str, bool]:
     """Check if package is installed and return version.
 
     Returns:
-        str | boll: Version of package if installed, False otherwise.
+        str | bool: Version of package if installed, False otherwise.
     """
     try:
         installed = distribution(package_name)
@@ -38,7 +38,15 @@ def check_version(package_name: str) -> Union[str, bool]:
     else:
         return installed.version
 
-def read_metafile(distpath):
+def read_metafile(distpath: str) -> Tuple[Optional[str], Optional[str], str]:
+    """Read metadata from a distribution path.
+
+    Args:
+        distpath: Path to the distribution directory
+
+    Returns:
+        Tuple of (package_name, version, distpath)
+    """
     name = None
     version = None
     try:
@@ -54,7 +62,15 @@ def read_metafile(distpath):
         print(f'error reading {distpath}: {e} {type(e)}')
     return name, version, distpath
 
-def get_local_libs(libpath):
+def get_local_libs(libpath: str) -> List[Dict[str, str]]:
+    """Get list of installed packages from a local library path.
+
+    Args:
+        libpath: Path to the local library directory
+
+    Returns:
+        List of dictionaries with package metadata
+    """
     alldirs = sorted([k for k in glob.glob(libpath+'**',recursive=False, include_hidden=True) if os.path.isdir(k)])
     dists_found = [k for k in alldirs if os.path.exists(k+'/METADATA')]
     print(f'alldirs: {len(alldirs)} dists_found: {len(dists_found)} in {libpath}')
@@ -72,7 +88,16 @@ def get_local_libs(libpath):
     nodist_list = [k for k in alldirs if k.split('/')[-1] not in dists_found]
     return name_list
 
-async def check_pypi_version(libname, client):
+async def check_pypi_version(libname: str, client: httpx.AsyncClient) -> Tuple[Optional[str], Optional[str]]:
+    """Check PyPI for package version information.
+
+    Args:
+        libname: Name of the package to check
+        client: HTTP client to use for requests
+
+    Returns:
+        Tuple of (package_name, version) or (None, None) on error
+    """
     baseurl = f'https://pypi.org/project/{libname}'
     pkg_name = None
     pkg_version = None
@@ -88,10 +113,24 @@ async def check_pypi_version(libname, client):
         logger.error(f'Error checking {libname}: {e} {type(e)} baseurl={baseurl}')
     finally:
         # Always return a tuple
-        await asyncio.sleep(0.5)  # To avoid hitting the server too hard
+        await asyncio.sleep(0.1)  # To avoid hitting the server too hard
         return pkg_name, pkg_version
 
-async def check_local_libs(libpath, args, config):
+async def check_local_libs(
+    libpath: str,
+    args: argparse.Namespace,
+    config: Any
+) -> Tuple[List[str], List[Dict[str, str]]]:
+    """Check local libraries for updates against PyPI.
+
+    Args:
+        libpath: Path to the local library directory
+        args: Command-line arguments
+        config: Configuration object
+
+    Returns:
+        Tuple of (outdated_libs, error_list)
+    """
     client = await get_session(args, config)
     local_libs = get_local_libs(libpath)
     outdated_libs = []
@@ -137,9 +176,19 @@ async def check_local_libs(libpath, args, config):
             pass  # print(f'{lib["name"]} is up to date')
 
     print(f'outdated libs: {len(outdated_libs)} error list: {len(error_list)}')
+    await client.aclose()  # Added proper cleanup
     return outdated_libs, error_list
 
-async def get_session(args, config):
+async def get_session(args: argparse.Namespace, config: Any) -> httpx.AsyncClient:
+    """Create and initialize an HTTP client session with PyPI authentication.
+
+    Args:
+        args: Command-line arguments
+        config: Configuration object
+
+    Returns:
+        Initialized HTTP client
+    """
     query = args.query
     query = "".join(query)
     qurl = config.api_url + f"?q={query}"
@@ -187,7 +236,12 @@ async def get_session(args, config):
     await client.post(back_url, json=data)
     return client
 
-def get_args():
+def get_args() -> Tuple[argparse.ArgumentParser, argparse.Namespace]:
+    """Parse command line arguments.
+
+    Returns:
+        Tuple of (argument_parser, parsed_args)
+    """
     ap = argparse.ArgumentParser(prog="pip_search", description="Search for packages on PyPI")
     ap.add_argument("-s","--sort",type=str, const="name",nargs="?",choices=['name', 'version', 'released', 'stars','watchers','forks'],help="sort results by package name, version or release date (default: %(const)s)")
     ap.add_argument("query", nargs="*", type=str, help="terms to search pypi.org package repository")
