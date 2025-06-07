@@ -86,9 +86,7 @@ class Package:
         self.github_link = info["github_link"]
         self.info_set = True
 
-
-# todo add url to results
-def search(args, config, opts: Union[dict, Namespace] = {}) -> Generator[Package, None, None]:
+def get_session(args, config):
     query = args.query
     query = "".join(query)
     qurl = config.api_url + f"?q={query}"
@@ -138,15 +136,37 @@ def search(args, config, opts: Union[dict, Namespace] = {}) -> Generator[Package
         ],
     }
     r = session.post(back_url, json=data)
+    return session
 
+def get_snippets(args, config, session):
     # soup = BeautifulSoup(browser.page_source, "html.parser")
+    query = "".join(args.query)
+    snippets = []
     for page in range(1, config.page_size + 1):
         params = {"q": query, "page": page}
         r = session.get(config.api_url, params=params)
         soup = BeautifulSoup(r.text, "html.parser")
         snippets += soup.select('a[class*="package-snippet"]')
         logger.debug(f'[s] p:{page} snippets={len(snippets)} query={query} ')
+    return snippets
 
+def get_version_from_link(link: str, session) -> str:
+    """Extract version from the package link if available."""
+    r = session.get(link)
+    soup = BeautifulSoup(r.text, "html.parser")
+    # pkg_header = soup.select_one('h1[class="package-header__name"]')
+    version = "noversion"
+    try:
+        version = soup.select_one('p[class="release__version"]').text.strip()
+    except Exception as e:
+        logger.error(f"[gvl] Error getting version from link {link}: {e} {type(e)}")
+    finally:
+        return version
+
+# todo add url to results
+def search(args, config, opts: Union[dict, Namespace] = {}) -> Generator[Package, None, None]:
+    session = get_session(args, config)
+    snippets = get_snippets(args, config, session)
     # snippets = soup.select('a[class*="package-snippet"]')
     # logger.debug(f'qurl: {qurl} soup: {len(soup)} snippets: {len(snippets)}')
     authparam = None
@@ -158,7 +178,9 @@ def search(args, config, opts: Union[dict, Namespace] = {}) -> Generator[Package
         info = {}
         link = urljoin(config.api_url, snippet.get("href"))
         package = re.sub(r"\s+", " ", snippet.select_one('span[class*="package-snippet__name"]').text.strip())
-        version = 'noversion'  # re.sub(r"\s+"," ",snippet.select_one('span[class*="package-snippet__version"]').text.strip())
+        # todo get version from link
+        version = get_version_from_link(link, session)
+        # version = 'noversion'  # re.sub(r"\s+"," ",snippet.select_one('span[class*="package-snippet__version"]').text.strip())
         released = re.sub(r"\s+"," ",snippet.select_one('span[class*="package-snippet__created"]').find("time")["datetime"])
         description = re.sub(r"\s+"," ",snippet.select_one('p[class*="package-snippet__description"]').text.strip())
         pack = Package(package, version, released, description, link)
