@@ -167,8 +167,8 @@ async def search(args, config, opts: Union[dict, Namespace] = {}) -> List[Packag
             auth_str = f"{GITHUB_USERNAME}:{GITHUBAPITOKEN}"
             auth = base64.b64encode(auth_str.encode()).decode()
 
-    results = []
-    for snippet in snippets:
+    # Create a helper function to process each snippet
+    async def process_snippet(snippet):
         info = {}
         link = urljoin(config.api_url, snippet.get("href"))
         package = re.sub(r"\s+", " ", snippet.select_one('span[class*="package-snippet__name"]').text.strip())
@@ -187,7 +187,11 @@ async def search(args, config, opts: Union[dict, Namespace] = {}) -> List[Packag
         if args.debug:
             logger.debug(f'[s] pack: {pack} link: {link} info: {info}')
 
-        results.append(pack)
+        return pack
+
+    # Process all snippets concurrently
+    tasks = [process_snippet(snippet) for snippet in snippets]
+    results = await asyncio.gather(*tasks)
 
     await client.aclose()
     return results
