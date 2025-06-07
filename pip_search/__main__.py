@@ -65,9 +65,9 @@ def table_output(result, query, args, config):
 async def async_main():
     config = Config()
     ap, args = get_args()
-    if args.chklocallibs:
-        libpath = '~/.local/lib/python3.12/site-packages/'
-        outdated_libs,error_list = await check_local_libs(libpath)
+    if args.locallibs:
+        print(f'checking local libs in {args.locallibs}')
+        outdated_libs,error_list = await check_local_libs(args.locallibs, args, config)
         print(f'outdated libs: {len(outdated_libs)} errors: {len(error_list)} \n')
         print(f'\noutdated libs: {outdated_libs}\n')
         print(f'\nerrors: {error_list}\n')

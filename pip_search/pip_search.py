@@ -1,24 +1,16 @@
 import asyncio
-import sys
 import re
 import os
-import time
-import json
-import random
-import string
-import hashlib
 from loguru import logger
 from argparse import Namespace
 from dataclasses import InitVar, dataclass
 from datetime import datetime
-from typing import Generator, Union, List
+from typing import Union, List
 from urllib.parse import urljoin
-import httpx
-from httpx import AsyncClient
 from bs4 import BeautifulSoup
-
 import socket
 from urllib3.connection import HTTPConnection
+from utils import get_session
 
 HTTPConnection.default_socket_options = HTTPConnection.default_socket_options + [
     (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
@@ -82,54 +74,6 @@ class Package:
         self.watchers = info["watchers"]
         self.github_link = info["github_link"]
         self.info_set = True
-
-async def get_session(args, config):
-    query = args.query
-    query = "".join(query)
-    qurl = config.api_url + f"?q={query}"
-
-    client = AsyncClient()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-    }
-    params = {"q": query}
-    r = await client.get(config.api_url, params=params, headers=headers)
-
-    # Get script.js url
-    pattern = re.compile(r"/(.*)/script.js")
-    path = pattern.findall(r.text)[0]
-    script_url = f"https://pypi.org/{path}/script.js"
-
-    r = await client.get(script_url)
-
-    # Find the PoW data from script.js
-    pattern = re.compile(
-        r'init\(\[\{"ty":"pow","data":\{"base":"(.+?)","hash":"(.+?)","hmac":"(.+?)","expires":"(.+?)"\}\}\], "(.+?)"'
-    )
-    base, hash, hmac, expires, token = pattern.findall(r.text)[0]
-
-    # Compute the PoW answer
-    answer = ""
-    characters = string.ascii_letters + string.digits
-    for c1 in characters:
-        for c2 in characters:
-            c = base + c1 + c2
-            if hashlib.sha256(c.encode()).hexdigest() == hash:
-                answer = c1 + c2
-                break
-        if answer:
-            break
-
-    # Send the PoW answer
-    back_url = f"https://pypi.org/{path}/fst-post-back"
-    data = {
-        "token": token,
-        "data": [
-            {"ty": "pow", "base": base, "answer": answer, "hmac": hmac, "expires": expires}
-        ],
-    }
-    await client.post(back_url, json=data)
-    return client
 
 async def get_snippets(args, config, client):
     query = "".join(args.query)

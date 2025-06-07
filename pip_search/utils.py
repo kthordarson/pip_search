@@ -1,4 +1,7 @@
 import asyncio
+import re
+import string
+import hashlib
 from typing import Union, Tuple, List, Dict, Any
 import argparse
 import glob
@@ -69,23 +72,27 @@ def get_local_libs(libpath):
     nodist_list = [k for k in alldirs if k.split('/')[-1] not in dists_found]
     return name_list
 
-async def check_pypi_version(libname):
+async def check_pypi_version(libname, client):
     baseurl = f'https://pypi.org/project/{libname}'
     pkg_name = None
     pkg_version = None
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get(baseurl)
-            soup = BeautifulSoup(r.text, "html.parser")
-            pkgheader = soup.select('h1[class*="package-header__name"]',limit=1)
-            for p in pkgheader:
-                pkg_name,pkg_version = p.text.strip().split(' ')
-                return pkg_name, pkg_version
-        except Exception as e:
-            print(f'error checking {libname}: {e} {type(e)}')
-            return None, None
+    try:
+        r = await client.get(baseurl, follow_redirects=True)
+        soup = BeautifulSoup(r.text, "html.parser")
+        # pkgheader = soup.select('h1[class*="package-header__name"]',limit=1)
+        pkgheader = soup.select_one('h1[class*="package-header__name"]').text.strip()
+        pkg_name, pkg_version = pkgheader.split(' ')
+    except httpx.ConnectTimeout as e:
+        logger.warning(f'ConnectTimeout checking {libname}: {e} {type(e)} baseurl={baseurl}')
+    except Exception as e:
+        logger.error(f'Error checking {libname}: {e} {type(e)} baseurl={baseurl}')
+    finally:
+        # Always return a tuple
+        await asyncio.sleep(0.5)  # To avoid hitting the server too hard
+        return pkg_name, pkg_version
 
-async def check_local_libs(libpath):
+async def check_local_libs(libpath, args, config):
+    client = await get_session(args, config)
     local_libs = get_local_libs(libpath)
     outdated_libs = []
     error_list = []
@@ -93,32 +100,92 @@ async def check_local_libs(libpath):
     # Use gather to check all versions concurrently
     tasks = []
     for lib in local_libs:
-        tasks.append(check_pypi_version(lib["name"]))
+        tasks.append(check_pypi_version(lib["name"], client))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for i, result in enumerate(results):
         lib = local_libs[i]
         if isinstance(result, Exception):
-            print(f'Error checking {lib["name"]}: {result}')
+            logger.error(f'Error checking {lib["name"]}: {result}')
+            error_list.append(lib)
+            continue
+
+        # Handle None results or other unexpected types
+        if result is None:
+            logger.warning(f'Received None result for {lib["name"]}')
+            error_list.append(lib)
+            continue
+
+        # Make sure result is a tuple/list with at least 2 elements
+        if not isinstance(result, (tuple, list)) or len(result) < 2:
+            logger.warning(f'Unexpected result type for {lib["name"]}: {type(result)}')
             error_list.append(lib)
             continue
 
         pypi_name, pypi_version = result
-        if pypi_name is None:
-            print(f'TypeError checking {lib}')
+        if pypi_name is None or pypi_version is None:
+            # logger.warning(f'Missing name or version for {lib["name"]}')
             error_list.append(lib)
             continue
 
         print(f'pypi: {pypi_name} {pypi_version} local: {lib["name"]} {lib["version"]}')
         if pypi_version != lib["version"]:
-            print(f'upgrade {lib["name"]} from {lib["version"]} to {pypi_version} outdated libs: {len(outdated_libs)}')
+            print(f'\tupgrade {lib["name"]} from {lib["version"]} to {pypi_version}')
             outdated_libs.append(lib["name"])
         else:
             pass  # print(f'{lib["name"]} is up to date')
 
     print(f'outdated libs: {len(outdated_libs)} error list: {len(error_list)}')
     return outdated_libs, error_list
+
+async def get_session(args, config):
+    query = args.query
+    query = "".join(query)
+    qurl = config.api_url + f"?q={query}"
+
+    client = httpx.AsyncClient()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    }
+    params = {"q": query}
+    r = await client.get(config.api_url, params=params, headers=headers)
+
+    # Get script.js url
+    pattern = re.compile(r"/(.*)/script.js")
+    path = pattern.findall(r.text)[0]
+    script_url = f"https://pypi.org/{path}/script.js"
+
+    r = await client.get(script_url)
+
+    # Find the PoW data from script.js
+    pattern = re.compile(
+        r'init\(\[\{"ty":"pow","data":\{"base":"(.+?)","hash":"(.+?)","hmac":"(.+?)","expires":"(.+?)"\}\}\], "(.+?)"'
+    )
+    base, hash, hmac, expires, token = pattern.findall(r.text)[0]
+
+    # Compute the PoW answer
+    answer = ""
+    characters = string.ascii_letters + string.digits
+    for c1 in characters:
+        for c2 in characters:
+            c = base + c1 + c2
+            if hashlib.sha256(c.encode()).hexdigest() == hash:
+                answer = c1 + c2
+                break
+        if answer:
+            break
+
+    # Send the PoW answer
+    back_url = f"https://pypi.org/{path}/fst-post-back"
+    data = {
+        "token": token,
+        "data": [
+            {"ty": "pow", "base": base, "answer": answer, "hmac": hmac, "expires": expires}
+        ],
+    }
+    await client.post(back_url, json=data)
+    return client
 
 def get_args():
     ap = argparse.ArgumentParser(prog="pip_search", description="Search for packages on PyPI")
@@ -129,6 +196,6 @@ def get_args():
     ap.add_argument("-e", "--extra", action="store_true", default=False, help="get extra github info")
     ap.add_argument("-d", "--debug", action="store_true", default=False, help="debugmode")
     ap.add_argument("-l", "--links", action="store_true", default=False, help="show links")
-    ap.add_argument("--chklocallibs", action="store_true", default=False, help="check local libs ~/lib/pythonxxx/site-packages ")
+    ap.add_argument("--locallibs", action="store", default=False, help="check local libs ~/lib/pythonxxx/site-packages", dest="locallibs")
     args = ap.parse_args()
     return ap, args
