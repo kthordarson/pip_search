@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import re
 import os
@@ -10,11 +11,10 @@ from loguru import logger
 from argparse import Namespace
 from dataclasses import InitVar, dataclass
 from datetime import datetime
-from typing import Generator, Union
+from typing import Generator, Union, List
 from urllib.parse import urljoin
 import httpx
-import requests
-from requests.auth import HTTPBasicAuth
+from httpx import AsyncClient
 from bs4 import BeautifulSoup
 
 import socket
@@ -45,9 +45,6 @@ class Config:
     sort_by: str = "name"
     date_format: str = "%d-%-m-%Y"
     link_defualt_format: str = "https://pypi.org/project/{package.name}"
-
-
-# config = Config()
 
 
 @dataclass
@@ -86,30 +83,26 @@ class Package:
         self.github_link = info["github_link"]
         self.info_set = True
 
-def get_session(args, config):
+async def get_session(args, config):
     query = args.query
     query = "".join(query)
     qurl = config.api_url + f"?q={query}"
 
-    # time.sleep(5)
-
-    snippets = []
-    session = requests.Session()
+    client = AsyncClient()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
     }
     params = {"q": query}
-    r = session.get(config.api_url, params=params, headers=headers)
+    r = await client.get(config.api_url, params=params, headers=headers)
 
     # Get script.js url
     pattern = re.compile(r"/(.*)/script.js")
     path = pattern.findall(r.text)[0]
     script_url = f"https://pypi.org/{path}/script.js"
 
-    r = session.get(script_url)
+    r = await client.get(script_url)
 
     # Find the PoW data from script.js
-    # TODO: make the pattern more robust
     pattern = re.compile(
         r'init\(\[\{"ty":"pow","data":\{"base":"(.+?)","hash":"(.+?)","hmac":"(.+?)","expires":"(.+?)"\}\}\], "(.+?)"'
     )
@@ -135,122 +128,114 @@ def get_session(args, config):
             {"ty": "pow", "base": base, "answer": answer, "hmac": hmac, "expires": expires}
         ],
     }
-    r = session.post(back_url, json=data)
-    return session
+    await client.post(back_url, json=data)
+    return client
 
-def get_snippets(args, config, session):
-    # soup = BeautifulSoup(browser.page_source, "html.parser")
+async def get_snippets(args, config, client):
     query = "".join(args.query)
     snippets = []
     for page in range(1, config.page_size + 1):
         params = {"q": query, "page": page}
-        r = session.get(config.api_url, params=params)
+        r = await client.get(config.api_url, params=params)
         soup = BeautifulSoup(r.text, "html.parser")
         snippets += soup.select('a[class*="package-snippet"]')
         logger.debug(f'[s] p:{page} snippets={len(snippets)} query={query} ')
     return snippets
 
-def get_version_from_link(link: str, session) -> str:
+async def get_version_from_link(link: str, client) -> str:
     """Extract version from the package link if available."""
-    r = session.get(link)
-    soup = BeautifulSoup(r.text, "html.parser")
-    # pkg_header = soup.select_one('h1[class="package-header__name"]')
-    version = "noversion"
     try:
+        r = await client.get(link, follow_redirects=True)
+        soup = BeautifulSoup(r.text, "html.parser")
+        version = "noversion"
         version = soup.select_one('p[class="release__version"]').text.strip()
     except Exception as e:
         logger.error(f"[gvl] Error getting version from link {link}: {e} {type(e)}")
     finally:
         return version
 
-# todo add url to results
-def search(args, config, opts: Union[dict, Namespace] = {}) -> Generator[Package, None, None]:
-    session = get_session(args, config)
-    snippets = get_snippets(args, config, session)
-    # snippets = soup.select('a[class*="package-snippet"]')
-    # logger.debug(f'qurl: {qurl} soup: {len(soup)} snippets: {len(snippets)}')
-    authparam = None
+async def search(args, config, opts: Union[dict, Namespace] = {}) -> List[Package]:
+    client = await get_session(args, config)
+    snippets = await get_snippets(args, config, client)
+
+    auth = None
     if opts.extra:
         GITHUBAPITOKEN = os.getenv("GITHUBAPITOKEN")
         GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
-        authparam = HTTPBasicAuth(GITHUB_USERNAME, GITHUBAPITOKEN)
+        if GITHUBAPITOKEN and GITHUB_USERNAME:
+            import base64
+            auth_str = f"{GITHUB_USERNAME}:{GITHUBAPITOKEN}"
+            auth = base64.b64encode(auth_str.encode()).decode()
+
+    results = []
     for snippet in snippets:
         info = {}
         link = urljoin(config.api_url, snippet.get("href"))
         package = re.sub(r"\s+", " ", snippet.select_one('span[class*="package-snippet__name"]').text.strip())
-        # todo get version from link
-        version = get_version_from_link(link, session)
-        # version = 'noversion'  # re.sub(r"\s+"," ",snippet.select_one('span[class*="package-snippet__version"]').text.strip())
-        released = re.sub(r"\s+"," ",snippet.select_one('span[class*="package-snippet__created"]').find("time")["datetime"])
-        description = re.sub(r"\s+"," ",snippet.select_one('p[class*="package-snippet__description"]').text.strip())
+
+        version = await get_version_from_link(link, client)
+        released = re.sub(r"\s+", " ", snippet.select_one('span[class*="package-snippet__created"]').find("time")["datetime"])
+        description = re.sub(r"\s+", " ", snippet.select_one('p[class*="package-snippet__description"]').text.strip())
+
         pack = Package(package, version, released, description, link)
+
         if opts.extra:
-            info = get_github_info(link, authparam)
+            info = await get_github_info(link, auth, client)
             if info:
                 pack.set_gh_info(info)
+
         if args.debug:
             logger.debug(f'[s] pack: {pack} link: {link} info: {info}')
-        yield pack
 
+        results.append(pack)
 
-def get_repo_info(repo, auth):
-    session = requests.session()
-    # info = {'stars':'', 'forks':'', 'watchers':'', 'set':False}
+    await client.aclose()
+    return results
+
+async def get_repo_info(repo, auth, client):
     info = {"stars": 0, "forks": 0, "watchers": 0, "set": False, "github_link": ""}
-    # session = requests.session()
     try:
         reponame = repo.split("github.com/")[1].rstrip("/")
     except IndexError as e:
         logger.error(f"[r] err:{e} repo:{repo}")
         return info
+
     apiurl = f"https://api.github.com/repos/{reponame}"
-    r = session.get(apiurl, auth=auth)
-    # logger.info(f'[r] repo:{repo} apiurl: {apiurl} r={r.status_code}')
+
+    headers = {}
+    if auth:
+        headers["Authorization"] = f"Basic {auth}"
+
+    r = await client.get(apiurl, headers=headers)
+
     if r.status_code == 401:
         if DEBUG:
-            logger.error(f"[r] autherr:401 repo: {repo} apiurl: {apiurl} a:{auth}")
+            logger.error(f"[r] autherr:401 repo: {repo} apiurl: {apiurl}")
         return info
     if r.status_code == 404:
         if DEBUG:
-            logger.warning(
-                f"[r] {r.status_code} url: {repo} r: {reponame} apiurl: {apiurl} not found"
-            )
+            logger.warning(f"[r] {r.status_code} url: {repo} r: {reponame} apiurl: {apiurl} not found")
         return info
     if r.status_code == 403:
         if DEBUG:
-            logger.warning(
-                f"[r] {r.status_code} r: {reponame} apiurl: {apiurl} API rate limit exceeded"
-            )
+            logger.warning(f"[r] {r.status_code} r: {reponame} apiurl: {apiurl} API rate limit exceeded")
         return info
     if r.status_code == 200:
         try:
-            info["stars"] = r.json().get(
-                "stargazers_count", 0
-            )  # str(r.json()["stargazers_count"])
-            info["forks"] = r.json().get("forks_count", 0)
-            info["watchers"] = r.json().get("watchers_count", 0)
+            json_data = r.json()
+            info["stars"] = json_data.get("stargazers_count", 0)
+            info["forks"] = json_data.get("forks_count", 0)
+            info["watchers"] = json_data.get("watchers_count", 0)
             info["github_link"] = repo
             info["set"] = True
             return info
         except (KeyError, TypeError, AttributeError) as err:
-            logger.error(f"[gri] {err} r:{r.status_code} apiurl:{apiurl} rj:{r.json()}")
+            logger.error(f"[gri] {err} r:{r.status_code} apiurl:{apiurl}")
             logger.error(f"[gri] info:{info}")
             return info
 
-
-def get_github_info(repolink, authparam):
-    gh_link = None
-    gh_link = get_links(repolink)
-    if gh_link:
-        info = get_repo_info(repo=gh_link["github"], auth=authparam)
-        return info
-    else:
-        return None
-
-
-def get_links(pkg_url):
-    s = requests.session()
-    r = s.get(pkg_url)
+async def get_links(pkg_url, client):
+    r = await client.get(pkg_url)
     soup = BeautifulSoup(r.text, "html.parser")
     homepage = ""
     githublink = ""
@@ -261,8 +246,6 @@ def get_links(pkg_url):
         logger.error(f'[err] err:{e} homepage not found pkg_url:{pkg_url}')
         return None
     try:
-        # .vertical-tabs__tabs > div:nth-child(2) > ul:nth-child(2) > li:nth-child(2) > a:nth-child(1)
-        # '.vertical-tabs__tabs > div:nth-child(2) > ul:nth-child(2) > li:nth-child(1) > a:nth-child(1)'
         if "issues" in homepage:
             try:
                 issues_homepage = soup.select_one(".vertical-tabs__tabs > div:nth-child(2) > ul:nth-child(2) > li:nth-child(2) > a:nth-child(1)", href=True,).attrs["href"]
@@ -276,14 +259,13 @@ def get_links(pkg_url):
         else:
             return None
     except AttributeError as e:
-        # pass
         logger.warning(f"[err] err:{e} homepage not found pkg_url:{pkg_url}")
         return None
-    # try:
-    #     githublink = soup.select_one('.vertical-tabs__tabs > div:nth-child(2) > ul:nth-child(2) > li:nth-child(2) > a:nth-child(1)',href=True).attrs['href']
-    #     githublink = githublink.replace('/tags','')
-    #     return {'github':githublink, 'homepage':homepage}
-    # except AttributeError as e:
-    #     # pass
-    #     logger.warning(f'[err] err:{e} gh link not found pkg_url:{pkg_url} h:{homepage}')
-    # return {'github':githublink, 'homepage':homepage}
+
+async def get_github_info(repolink, auth, client):
+    gh_link = await get_links(repolink, client)
+    if gh_link:
+        info = await get_repo_info(repo=gh_link["github"], auth=auth, client=client)
+        return info
+    else:
+        return None
