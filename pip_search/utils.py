@@ -88,12 +88,13 @@ def get_local_libs(libpath: str) -> List[Dict[str, str]]:
     nodist_list = [k for k in alldirs if k.split('/')[-1] not in dists_found]
     return name_list
 
-async def check_pypi_version(libname: str, client: httpx.AsyncClient) -> Tuple[Optional[str], Optional[str]]:
-    """Check PyPI for package version information.
+async def check_pypi_version(libname: str, client: httpx.AsyncClient, max_retries: int = 3) -> Tuple[Optional[str], Optional[str]]:
+    """Check PyPI for package version information with retry logic.
 
     Args:
         libname: Name of the package to check
         client: HTTP client to use for requests
+        max_retries: Maximum number of retry attempts (default: 3)
 
     Returns:
         Tuple of (package_name, version) or (None, None) on error
@@ -101,20 +102,30 @@ async def check_pypi_version(libname: str, client: httpx.AsyncClient) -> Tuple[O
     baseurl = f'https://pypi.org/project/{libname}'
     pkg_name = None
     pkg_version = None
-    try:
-        r = await client.get(baseurl, follow_redirects=True)
-        soup = BeautifulSoup(r.text, "html.parser")
-        # pkgheader = soup.select('h1[class*="package-header__name"]',limit=1)
-        pkgheader = soup.select_one('h1[class*="package-header__name"]').text.strip()
-        pkg_name, pkg_version = pkgheader.split(' ')
-    except httpx.ConnectTimeout as e:
-        logger.warning(f'ConnectTimeout checking {libname}: {e} {type(e)} baseurl={baseurl}')
-    except Exception as e:
-        logger.error(f'Error checking {libname}: {e} {type(e)} baseurl={baseurl}')
-    finally:
-        # Always return a tuple
-        await asyncio.sleep(0.1)  # To avoid hitting the server too hard
-        return pkg_name, pkg_version
+
+    for attempt in range(max_retries):
+        try:
+            # Use timeout parameter to avoid hanging requests
+            r = await client.get(baseurl, follow_redirects=True, timeout=10.0)
+            soup = BeautifulSoup(r.text, "html.parser")
+            pkgheader = soup.select_one('h1[class*="package-header__name"]').text.strip()
+            pkg_name, pkg_version = pkgheader.split(' ')
+            break  # Success, exit the retry loop
+        except httpx.ConnectTimeout as e:
+            backoff_time = 0.5 * (2 ** attempt)  # Exponential backoff: 0.5s, 1s, 2s
+            logger.warning(f'ConnectTimeout checking {libname} (attempt {attempt+1}/{max_retries}): {e} baseurl={baseurl}')
+            if attempt < max_retries - 1:  # If not the last attempt
+                logger.info(f'Retrying in {backoff_time:.1f} seconds')
+                await asyncio.sleep(backoff_time)
+            else:
+                logger.warning(f'Failed to connect to {baseurl} after {max_retries} attempts')
+        except Exception as e:
+            logger.error(f'Error checking {libname}: {e} {type(e)} baseurl={baseurl}')
+            break  # Don't retry for non-timeout errors
+
+    # Always return a tuple
+    await asyncio.sleep(0.1)  # To avoid hitting the server too hard
+    return pkg_name, pkg_version
 
 async def check_local_libs(
     libpath: str,
