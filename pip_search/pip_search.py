@@ -1,24 +1,17 @@
 import asyncio
-import sys
 import re
 import os
-import time
-import json
-import random
-import string
-import hashlib
 from loguru import logger
 from argparse import Namespace
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime
-from typing import Generator, Union, List
+from typing import Union, List, Dict, Optional, Any, TypeVar
 from urllib.parse import urljoin
-import httpx
-from httpx import AsyncClient
-from bs4 import BeautifulSoup
-
+from bs4 import BeautifulSoup, Tag
 import socket
+import httpx
 from urllib3.connection import HTTPConnection
+from utils import get_session
 
 HTTPConnection.default_socket_options = HTTPConnection.default_socket_options + [
     (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
@@ -55,17 +48,20 @@ class Package:
     version: str
     released: str
     description: str
-    link: InitVar[str] = None
+    link: InitVar[Optional[str]] = None
 
-    def __post_init__(self, link: str = None):
+    config: Config = field(init=False, repr=False)
+    released_date: datetime = field(init=False, repr=False)
+    stars: int = field(default=0, init=False)
+    forks: int = field(default=0, init=False)
+    watchers: int = field(default=0, init=False)
+    github_link: str = field(default="", init=False)
+    info_set: bool = field(default=False, init=False)
+
+    def __post_init__(self, link: Optional[str] = None) -> None:
         self.config = Config()
         self.link = link or self.config.link_defualt_format.format(package=self)
         self.released_date = datetime.strptime(self.released, "%Y-%m-%dT%H:%M:%S%z")
-        self.stars: int = 0
-        self.forks: int = 0
-        self.watchers: int = 0
-        self.github_link: str = ""
-        self.info_set: bool = False
 
     def released_date_str(self, date_format: str) -> str:
         """Return the released date as a string formatted
@@ -76,62 +72,33 @@ class Package:
         """
         return self.released_date.strftime(date_format)
 
-    def set_gh_info(self, info):
+    def set_gh_info(self, info: Dict[str, Any]) -> None:
+        """Set GitHub repository information.
+
+        Args:
+            info: Dictionary containing GitHub repository information
+        """
         self.stars = info["stars"]
         self.forks = info["forks"]
         self.watchers = info["watchers"]
         self.github_link = info["github_link"]
         self.info_set = True
 
-async def get_session(args, config):
-    query = args.query
-    query = "".join(query)
-    qurl = config.api_url + f"?q={query}"
+async def get_snippets(
+    args: Namespace,
+    config: Config,
+    client: httpx.AsyncClient
+) -> List[Tag]:
+    """Get package snippets from PyPI search results.
 
-    client = AsyncClient()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-    }
-    params = {"q": query}
-    r = await client.get(config.api_url, params=params, headers=headers)
+    Args:
+        args: Command-line arguments
+        config: Configuration object
+        client: HTTP client
 
-    # Get script.js url
-    pattern = re.compile(r"/(.*)/script.js")
-    path = pattern.findall(r.text)[0]
-    script_url = f"https://pypi.org/{path}/script.js"
-
-    r = await client.get(script_url)
-
-    # Find the PoW data from script.js
-    pattern = re.compile(
-        r'init\(\[\{"ty":"pow","data":\{"base":"(.+?)","hash":"(.+?)","hmac":"(.+?)","expires":"(.+?)"\}\}\], "(.+?)"'
-    )
-    base, hash, hmac, expires, token = pattern.findall(r.text)[0]
-
-    # Compute the PoW answer
-    answer = ""
-    characters = string.ascii_letters + string.digits
-    for c1 in characters:
-        for c2 in characters:
-            c = base + c1 + c2
-            if hashlib.sha256(c.encode()).hexdigest() == hash:
-                answer = c1 + c2
-                break
-        if answer:
-            break
-
-    # Send the PoW answer
-    back_url = f"https://pypi.org/{path}/fst-post-back"
-    data = {
-        "token": token,
-        "data": [
-            {"ty": "pow", "base": base, "answer": answer, "hmac": hmac, "expires": expires}
-        ],
-    }
-    await client.post(back_url, json=data)
-    return client
-
-async def get_snippets(args, config, client):
+    Returns:
+        List of BeautifulSoup Tag objects representing package snippets
+    """
     query = "".join(args.query)
     snippets = []
     for page in range(1, config.page_size + 1):
@@ -142,8 +109,16 @@ async def get_snippets(args, config, client):
         logger.debug(f'[s] p:{page} snippets={len(snippets)} query={query} ')
     return snippets
 
-async def get_version_from_link(link: str, client) -> str:
-    """Extract version from the package link if available."""
+async def get_version_from_link(link: str, client: httpx.AsyncClient) -> str:
+    """Extract version from the package link if available.
+
+    Args:
+        link: URL to package details page
+        client: HTTP client
+
+    Returns:
+        Version string or "noversion" if not found
+    """
     try:
         r = await client.get(link, follow_redirects=True)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -154,7 +129,21 @@ async def get_version_from_link(link: str, client) -> str:
     finally:
         return version
 
-async def search(args, config, opts: Union[dict, Namespace] = {}) -> List[Package]:
+async def search(
+    args: Namespace,
+    config: Config,
+    opts: Union[Dict[str, Any], Namespace] = {}
+) -> List[Package]:
+    """Search for packages on PyPI.
+
+    Args:
+        args: Command-line arguments
+        config: Configuration object
+        opts: Additional options
+
+    Returns:
+        List of Package objects
+    """
     client = await get_session(args, config)
     snippets = await get_snippets(args, config, client)
 
@@ -168,7 +157,7 @@ async def search(args, config, opts: Union[dict, Namespace] = {}) -> List[Packag
             auth = base64.b64encode(auth_str.encode()).decode()
 
     # Create a helper function to process each snippet
-    async def process_snippet(snippet):
+    async def process_snippet(snippet: Tag) -> Package:
         info = {}
         link = urljoin(config.api_url, snippet.get("href"))
         package = re.sub(r"\s+", " ", snippet.select_one('span[class*="package-snippet__name"]').text.strip())
@@ -196,7 +185,21 @@ async def search(args, config, opts: Union[dict, Namespace] = {}) -> List[Packag
     await client.aclose()
     return results
 
-async def get_repo_info(repo, auth, client):
+async def get_repo_info(
+    repo: str,
+    auth: Optional[str],
+    client: httpx.AsyncClient
+) -> Dict[str, Any]:
+    """Get repository information from GitHub API.
+
+    Args:
+        repo: GitHub repository URL
+        auth: GitHub API authentication string
+        client: HTTP client
+
+    Returns:
+        Dictionary containing repository information
+    """
     info = {"stars": 0, "forks": 0, "watchers": 0, "set": False, "github_link": ""}
     try:
         reponame = repo.split("github.com/")[1].rstrip("/")
@@ -238,7 +241,16 @@ async def get_repo_info(repo, auth, client):
             logger.error(f"[gri] info:{info}")
             return info
 
-async def get_links(pkg_url, client):
+async def get_links(pkg_url: str, client: httpx.AsyncClient) -> Optional[Dict[str, str]]:
+    """Get homepage and GitHub links from package URL.
+
+    Args:
+        pkg_url: Package URL
+        client: HTTP client
+
+    Returns:
+        Dictionary containing homepage and GitHub links, or None if not found
+    """
     r = await client.get(pkg_url)
     soup = BeautifulSoup(r.text, "html.parser")
     homepage = ""
@@ -266,7 +278,21 @@ async def get_links(pkg_url, client):
         logger.warning(f"[err] err:{e} homepage not found pkg_url:{pkg_url}")
         return None
 
-async def get_github_info(repolink, auth, client):
+async def get_github_info(
+    repolink: str,
+    auth: Optional[str],
+    client: httpx.AsyncClient
+) -> Optional[Dict[str, Any]]:
+    """Get GitHub repository information for a package.
+
+    Args:
+        repolink: Package URL
+        auth: GitHub API authentication string
+        client: HTTP client
+
+    Returns:
+        Dictionary containing GitHub repository information, or None if not found
+    """
     gh_link = await get_links(repolink, client)
     if gh_link:
         info = await get_repo_info(repo=gh_link["github"], auth=auth, client=client)
