@@ -1,8 +1,9 @@
-from typing import Union
+import asyncio
+from typing import Union, Tuple, List, Dict, Any
 import argparse
 import glob
 import os
-import requests
+import httpx
 from bs4 import BeautifulSoup
 from loguru import logger
 
@@ -50,12 +51,9 @@ def read_metafile(distpath):
         print(f'error reading {distpath}: {e} {type(e)}')
     return name, version, distpath
 
-# : res = [k for k in search(name_list[0],args) if k.name == name_list[0]]
-
 def get_local_libs(libpath):
     alldirs = sorted([k for k in glob.glob(libpath+'**',recursive=False, include_hidden=True) if os.path.isdir(k)])
     dists_found = [k for k in alldirs if os.path.exists(k+'/METADATA')]
-    # dists_found = [k for k in glob.glob(libpath+'**',recursive=False, include_hidden=True) if os.path.isdir(k) and 'dist-info' in k and os.path.exists(k+'/METADATA')]
     print(f'alldirs: {len(alldirs)} dists_found: {len(dists_found)} in {libpath}')
     name_list = []
     nodist_list = []
@@ -71,42 +69,54 @@ def get_local_libs(libpath):
     nodist_list = [k for k in alldirs if k.split('/')[-1] not in dists_found]
     return name_list
 
-def check_pypi_version(libname):
+async def check_pypi_version(libname):
     baseurl = f'https://pypi.org/project/{libname}'
     pkg_name = None
     pkg_version = None
-    session = requests.Session()
-    try:
-        r = session.get(baseurl)
-        soup = BeautifulSoup(r.text, "html.parser")
-        # pkgheader = soup.select('h1[class*="package-header__name"]',limit=1)
-        pkgheader = soup.select('h1[class*="package-header__name"]',limit=1)
-        for p in pkgheader:
-            pkg_name,pkg_version = p.text.strip().split(' ')
-            return pkg_name, pkg_version
-    except Exception as e:
-        print(f'error checking {libname}: {e} {type(e)}')
-        return None, None
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.get(baseurl)
+            soup = BeautifulSoup(r.text, "html.parser")
+            pkgheader = soup.select('h1[class*="package-header__name"]',limit=1)
+            for p in pkgheader:
+                pkg_name,pkg_version = p.text.strip().split(' ')
+                return pkg_name, pkg_version
+        except Exception as e:
+            print(f'error checking {libname}: {e} {type(e)}')
+            return None, None
 
-
-def check_local_libs(libpath):
+async def check_local_libs(libpath):
     local_libs = get_local_libs(libpath)
     outdated_libs = []
     error_list = []
+
+    # Use gather to check all versions concurrently
+    tasks = []
     for lib in local_libs:
-        # print(f'checking {lib["name"]}')
-        try:
-            pypi_name, pypi_version = check_pypi_version(lib["name"])
-        except TypeError as e:
-            print(f'TypeError checking {lib}: {e}')
+        tasks.append(check_pypi_version(lib["name"]))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for i, result in enumerate(results):
+        lib = local_libs[i]
+        if isinstance(result, Exception):
+            print(f'Error checking {lib["name"]}: {result}')
             error_list.append(lib)
             continue
+
+        pypi_name, pypi_version = result
+        if pypi_name is None:
+            print(f'TypeError checking {lib}')
+            error_list.append(lib)
+            continue
+
         print(f'pypi: {pypi_name} {pypi_version} local: {lib["name"]} {lib["version"]}')
         if pypi_version != lib["version"]:
             print(f'upgrade {lib["name"]} from {lib["version"]} to {pypi_version} outdated libs: {len(outdated_libs)}')
             outdated_libs.append(lib["name"])
         else:
             pass  # print(f'{lib["name"]} is up to date')
+
     print(f'outdated libs: {len(outdated_libs)} error list: {len(error_list)}')
     return outdated_libs, error_list
 
@@ -121,4 +131,4 @@ def get_args():
     ap.add_argument("-l", "--links", action="store_true", default=False, help="show links")
     ap.add_argument("--chklocallibs", action="store_true", default=False, help="check local libs ~/lib/pythonxxx/site-packages ")
     args = ap.parse_args()
-    return args
+    return ap, args
