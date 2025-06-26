@@ -119,6 +119,7 @@ async def get_version_from_link(link: str, client: httpx.AsyncClient) -> str:
     Returns:
         Version string or "noversion" if not found
     """
+    version = '[notfound]'
     try:
         r = await client.get(link, follow_redirects=True)
         soup = BeautifulSoup(r.text, "html.parser")
