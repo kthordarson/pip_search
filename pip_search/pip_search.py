@@ -145,8 +145,16 @@ async def search(
     Returns:
         List of Package objects
     """
-    client = await get_session(args, config)
-    snippets = await get_snippets(args, config, client)
+    try:
+        client = await get_session(args, config)
+    except Exception as e:
+        logger.error(f"[s] Error creating HTTP client: {e} {type(e)}")
+        return []
+    try:
+        snippets = await get_snippets(args, config, client)
+    except Exception as e:
+        logger.error(f"[s] Error getting snippets: {e} {type(e)}")
+        return []
 
     auth = None
     if opts.extra:

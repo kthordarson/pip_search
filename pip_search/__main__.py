@@ -19,11 +19,13 @@ try:
 except (ModuleNotFoundError, ImportError) as e:
     # logger.warning(f"pip_search __version__  module not found: {e} {type(e)}")
     __version__ = "0.0.0"
-try:
-    from .utils import check_version, check_local_libs, get_args
-except (ModuleNotFoundError, ImportError) as e:
-    # logger.warning(f"pip_search utils module not found: {e} {type(e)}")
-    from utils import check_version, check_local_libs, get_args
+# try:
+#     from .utils import check_version, get_args
+#     from .local_libs import check_local_libs
+# except (ModuleNotFoundError, ImportError) as e:
+#     logger.warning(f"pip_search utils module not found: {e} {type(e)}")
+from utils import check_version, get_args
+from local_libs import check_local_libs
 
 
 def text_output(result: List[Package], query: str, args: argparse.Namespace) -> None:
