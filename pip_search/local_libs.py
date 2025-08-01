@@ -38,11 +38,7 @@ def get_local_libs(libpath: str) -> List[Dict[str, str]]:
     return name_list
 
 
-async def check_local_libs(
-    libpath: str,
-    args: argparse.Namespace,
-    config: Any
-) -> Tuple[List[str], List[Dict[str, str]]]:
+async def check_local_libs(libpath: str, args: argparse.Namespace, config: Any) -> Tuple[List[str], List[Dict[str, str]]]:
     """Check local libraries for updates against PyPI.
 
     Args:

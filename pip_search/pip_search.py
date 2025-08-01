@@ -1,4 +1,4 @@
-from playwright.async_api import async_playwright
+import json
 import asyncio
 import re
 import os
@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup, Tag
 import socket
 import httpx
 from urllib3.connection import HTTPConnection
-from utils import get_session, get_session_with_playwright
+from utils import get_session
 
 HTTPConnection.default_socket_options = HTTPConnection.default_socket_options + [
     (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
@@ -85,11 +85,7 @@ class Package:
         self.github_link = info["github_link"]
         self.info_set = True
 
-async def get_snippets(
-    args: Namespace,
-    config: Config,
-    client: httpx.AsyncClient
-) -> List[Tag]:
+async def get_snippets(args: Namespace, config: Config, client: httpx.AsyncClient) -> List[Tag]:
     """Get package snippets from PyPI search results.
 
     Args:
@@ -132,11 +128,7 @@ async def get_version_from_link(link: str, client: httpx.AsyncClient) -> str:
     finally:
         return version
 
-async def oldsearch(
-    args: Namespace,
-    config: Config,
-    opts: Union[Dict[str, Any], Namespace] = {}
-) -> List[Package]:
+async def oldsearch(args: Namespace, config: Config, opts: Union[Dict[str, Any], Namespace] = {}) -> List[Package]:
     """Search for packages on PyPI.
 
     Args:
@@ -149,7 +141,7 @@ async def oldsearch(
     """
     try:
         # client = await get_session(args, config)
-        client = await get_session_with_playwright(args, config)
+        client = await search(args, config)
     except Exception as e:
         logger.error(f"[s] Error creating HTTP client: {e} {type(e)}")
         return []
@@ -198,114 +190,867 @@ async def oldsearch(
     await client.aclose()
     return results
 
-async def search_with_playwright(query: str, page_count: int = 2) -> List[dict]:
-    """Use Playwright to directly search and scrape results from PyPI."""
+async def search_pypi(query: str, page_count: int = 2, args: Namespace = None, config: Config = None) -> List[dict]:
+    """Search PyPI using multiple strategies to bypass challenges.
+
+    Args:
+        query: Search query string
+        page_count: Number of pages to search
+        args: Command-line arguments
+        config: Configuration object
+
+    Returns:
+        List of dictionaries with package information
+    """
+    if args is None:
+        # Create minimal args object for logging if none provided
+        class MinimalArgs:
+            debug = False
+            query = query
+        args = MinimalArgs()
+
+    if config is None:
+        config = Config()
+
     results = []
-    browser_args = [
-                    '--no-sandbox',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage',
-                    '--disable-extensions',
-                    '--disable-gpu',
-                    '--disable-web-security',
-                    '--allow-running-insecure-content'
-                ]
 
-    browser_viewport = {'width': 1920, 'height': 1080},
-    browser_locale = 'en-US',
-    browser_timezone_id = 'America/New_York',
-    # Add some realistic browser features
-    browser_extra_http_headers = {
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-            }
+    # Create a client with focused JSON API headers
+    headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://pypi.org/",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",}
+    # client = httpx.AsyncClient(follow_redirects=True, timeout=30.0,headers=headers)
+    client = await get_session(args, config)
+    try:
+        # Approach 1: Try direct package lookup first
+        if args.debug:
+            logger.debug(f"Trying direct package lookup for '{query}'")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=browser_args)
-        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        await context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined,
-                    });
+        json_url = f"https://pypi.org/pypi/{query}/json"
+        response = await client.get(json_url)
 
-                    // Remove automation indicators
-                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-                """)
+        if response.status_code == 200:
+            # Found exact package match
+            data = response.json()
+            info = data.get("info", {})
+            name = info.get("name", query)
+            version = info.get("version", "unknown")
 
-        page = await context.new_page()
+            # Get release date
+            release_date = "unknown"
+            releases = data.get("releases", {})
+            if version in releases and releases[version]:
+                for release in releases[version]:
+                    if "upload_time" in release:
+                        release_date = release["upload_time"]
+                        break
 
-        for page_num in range(1, page_count + 1):
-            url = f"https://pypi.org/search/?q={query}&page={page_num}"
+            results.append({
+                "name": name,
+                "version": version,
+                "description": info.get("summary", ""),
+                "released": release_date,
+                "link": f"https://pypi.org/project/{name}/"
+            })
+
+            if args.debug:
+                logger.debug(f"Found exact package match: {name}")
+
+        # Approach 2: Use PyPI Simple API to find similar packages
+        if not results or query != results[0]['name'].lower():
+            if args.debug:
+                logger.debug("Using PyPI Simple API to find matching packages")
+
+            # The Simple API is much less protected than the search page
+            simple_url = "https://pypi.org/simple/"
+            response = await client.get(simple_url)
+
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+                matching_packages = []
+
+                # Find packages that match or contain our query string
+                for link in soup.find_all("a"):
+                    pkg_name = link.text.strip()
+                    if query.lower() in pkg_name.lower():
+                        matching_packages.append(pkg_name)
+
+                if args.debug:
+                    logger.debug(f"Found {len(matching_packages)} potential matches")
+
+                # Limit to a reasonable number to avoid excessive API calls
+                max_matches = min(20, len(matching_packages))
+
+                # Sort by relevance - exact matches first, then startswith, then contains
+                sorted_matches = []
+                exact_matches = [pkg for pkg in matching_packages if pkg.lower() == query.lower()]
+                starts_with_matches = [pkg for pkg in matching_packages if pkg.lower().startswith(query.lower()) and pkg.lower() != query.lower()]
+                contains_matches = [pkg for pkg in matching_packages if query.lower() in pkg.lower() and not pkg.lower().startswith(query.lower())]
+
+                sorted_matches = exact_matches + starts_with_matches + contains_matches
+
+                # Get details for the top matches using the JSON API
+                for pkg_name in sorted_matches[:max_matches]:
+                    try:
+                        pkg_json_url = f"https://pypi.org/pypi/{pkg_name}/json"
+                        pkg_response = await client.get(pkg_json_url)
+
+                        if pkg_response.status_code == 200:
+                            pkg_data = pkg_response.json()
+                            pkg_info = pkg_data.get("info", {})
+
+                            # Skip if this package is already in our results
+                            if any(r["name"] == pkg_info.get("name") for r in results):
+                                continue
+
+                            version = pkg_info.get("version", "unknown")
+
+                            # Get release date
+                            released = "unknown"
+                            pkg_releases = pkg_data.get("releases", {})
+                            if version in pkg_releases and pkg_releases[version]:
+                                for release in pkg_releases[version]:
+                                    if "upload_time" in release:
+                                        released = release["upload_time"]
+                                        break
+
+                            # Add to our results
+                            results.append({
+                                "name": pkg_info.get("name", pkg_name),
+                                "version": version,
+                                "description": pkg_info.get("summary", ""),
+                                "released": released,
+                                "link": f"https://pypi.org/project/{pkg_name}/"
+                            })
+                    except Exception as e:
+                        if args.debug:
+                            logger.debug(f"Error getting JSON details for {pkg_name}: {e}")
+
+        # Approach 3: Use PyPI warehouse API (undocumented but works well)
+        if not results or len(results) < 5:  # If we have few or no results
             try:
-                await page.goto(url, wait_until="networkidle", timeout=30000)
-                # Wait a bit for any challenges to resolve
-                await asyncio.sleep(2)
-                # Check if we got real search results
-                page_content = await page.content()
-                if "Client Challenge" not in page_content:
-                    # Look for different possible selectors for package listings
-                    packages = await page.query_selector_all('a[class*="package-snippet"]')
-                    if not packages:
-                        # Try alternative selectors
-                        packages = await page.query_selector_all('[data-qa="package-snippet"]')
-                    if not packages:
-                        packages = await page.query_selector_all('article[class*="package-snippet"]')
-                    logger.debug(f"Found {len(packages)} packages on page {page_num}")
-                    for pkg in packages:
+                # This is an internal API used by PyPI's search interface
+                warehouse_api_url = f"https://pypi.org/search/api/?q={query}"
+                warehouse_response = await client.get(warehouse_api_url)
+                if warehouse_response.status_code == 200:
+                    if 'Client Challenge' in warehouse_response.text:
+                        logger.warning(f"Warehouse API {warehouse_api_url} returned challenge page, skipping. returing results: {results}")
+                    else:
                         try:
-                            # Try multiple selectors for each field
-                            name_elem = await pkg.query_selector('span[class*="package-snippet__name"]') or await pkg.query_selector('[data-qa="package-name"]') or await pkg.query_selector('h3')
-                            desc_elem = await pkg.query_selector('p[class*="package-snippet__description"]') or await pkg.query_selector('[data-qa="package-description"]') or await pkg.query_selector('p')
-                            time_elem = await pkg.query_selector('span[class*="package-snippet__created"] time') or await pkg.query_selector('time') or await pkg.query_selector('[datetime]')
+                            data = warehouse_response.json()
+                        except json.decoder.JSONDecodeError as e:
+                            logger.error(f"Error decoding JSON from warehouse API: {e} {type(e)}")
+                            data = {}
+                        for pkg in data.get("results", []):
+                            if args.debug:
+                                logger.debug(f"Found package via warehouse API: pkg: {pkg}")
+                            # Skip if this package is already in our results
+                            if any(r["name"] == pkg.get("name") for r in results):
+                                continue
+                            results.append({
+                                "name": pkg.get("name", ""),
+                                "version": pkg.get("version", "unknown"),
+                                "description": pkg.get("description", ""),
+                                "released": pkg.get("upload_time", "unknown"),
+                                "link": f"https://pypi.org/project/{pkg.get('name', '')}/"
+                            })
 
-                            if name_elem and desc_elem:
-                                name = await name_elem.text_content()
-                                description = await desc_elem.text_content()
-                                href = await pkg.get_attribute('href')
-
-                                released = None
-                                if time_elem:
-                                    released = await time_elem.get_attribute('datetime') or await time_elem.text_content()
-
-                                if name and description:
-                                    results.append({
-                                        'name': name.strip(),
-                                        'description': description.strip(),
-                                        'released': released or 'unknown',
-                                        'link': f"https://pypi.org{href}" if href else ""
-                                    })
-                        except Exception as e:
-                            logger.debug(f"Error extracting package info: {e}")
-                else:
-                    # Log some of the page content for debugging
-                    logger.debug(f"Still getting challenge page for search page {page_num} Page content preview: {page_content[:3000]}")
-
+                    if args.debug:
+                        logger.debug(f"Warehouse API returned {len(data.get('results', []))} results")
             except Exception as e:
-                logger.error(f"Error loading search page {page_num}: {e}")
+                if args.debug:
+                    logger.error(f"Warehouse API search failed: {e} {type(e)} datalen: {len(data)} {type(data)} {data.keys()}")
+    except Exception as e:
+        logger.error(f"Error searching PyPI: {e} {type(e)}")
 
-        await browser.close()
+    finally:
+        await client.aclose()
 
     return results
 
-async def search(
-    args: Namespace,
-    config: Config,
-    opts: Union[Dict[str, Any], Namespace] = {}
-) -> List[Package]:
+async def old_search_pypi(query: str, page_count: int = 2, args: Namespace = None, config: Config = None) -> List[dict]:
+    """Search PyPI using httpx with enhanced challenge handling.
+
+    Args:
+        query: Search query string
+        page_count: Number of pages to search
+        args: Command-line arguments
+        config: Configuration object
+
+    Returns:
+        List of dictionaries with package information
+    """
+    if args is None:
+        # Create minimal args object for logging if none provided
+        class MinimalArgs:
+            debug = False
+            query = query
+        args = MinimalArgs()
+
+    if config is None:
+        config = Config()
+
+    results = []
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            # Get a session with challenge handling
+            client = await get_session(args, config)
+
+            # Test if session works by making a simple search request first
+            test_url = f"{config.api_url}?q=test"
+            test_response = await client.get(test_url)
+
+            if "Client Challenge" in test_response.text:
+                if args.debug:
+                    logger.debug(f"Attempt {attempt+1}/{max_retries}: Still hitting challenge page")
+
+                # If we're not on the last attempt, try again with delay
+                if attempt < max_retries - 1:
+                    await client.aclose()
+                    await asyncio.sleep(2 * (attempt + 1))  # Exponential backoff
+                    continue
+            else:
+                # Session appears to be working, proceed with the search
+                for page_num in range(1, page_count + 1):
+                    params = {"q": query, "page": page_num}
+                    response = await client.get(config.api_url, params=params, follow_redirects=True)
+
+                    if args.debug:
+                        logger.debug(f"Search page {page_num} status: {response.status_code}")
+
+                    if "Client Challenge" in response.text:
+                        logger.warning(f"Challenge page detected for page {page_num}")
+                        continue
+
+                    # Parse the response with BeautifulSoup
+                    soup = BeautifulSoup(response.text, "html.parser")
+
+                    # Try different selectors for package listings
+                    packages = soup.select('a[class*="package-snippet"]')
+                    if not packages:
+                        packages = soup.select('[data-qa="package-snippet"]')
+                    if not packages:
+                        packages = soup.select('article[class*="package-snippet"]')
+
+                    if args.debug:
+                        logger.debug(f"Found {len(packages)} packages on page {page_num}")
+
+                    # Process each package
+                    for pkg in packages:
+                        try:
+                            # Try multiple selectors for each field
+                            name_elem = pkg.select_one('span[class*="package-snippet__name"]') or pkg.select_one('[data-qa="package-name"]') or pkg.select_one('h3')
+                            desc_elem = pkg.select_one('p[class*="package-snippet__description"]') or pkg.select_one('[data-qa="package-description"]') or pkg.select_one('p')
+                            time_elem = pkg.select_one('span[class*="package-snippet__created"] time') or pkg.select_one('time') or pkg.select_one('[datetime]')
+
+                            if name_elem and desc_elem:
+                                name = name_elem.text.strip()
+                                description = desc_elem.text.strip()
+
+                                href = pkg.get("href", "")
+                                released = None
+                                if time_elem:
+                                    released = time_elem.get("datetime") or time_elem.text.strip()
+
+                                results.append({
+                                    'name': name,
+                                    'description': description,
+                                    'released': released or 'unknown',
+                                    'link': f"https://pypi.org{href}" if href else ""
+                                })
+                        except Exception as e:
+                            if args.debug:
+                                logger.debug(f"Error extracting package info: {e}")
+
+                # If we got here without hitting challenges, break the retry loop
+                break
+
+        except Exception as e:
+            logger.error(f"Error during search (attempt {attempt+1}/{max_retries}): {e}")
+            await asyncio.sleep(1 * (attempt + 1))
+        finally:
+            # Always clean up the client
+            if 'client' in locals():
+                await client.aclose()
+
+    return results
+
+async def search_with_json_api(query: str, page_count: int = 2, args: Namespace = None, config: Config = None) -> List[dict]:
+    """Search PyPI using JSON API endpoints which bypass the challenge system entirely.
+
+    Args:
+        query: Search query string
+        page_count: Number of pages to search (not used for JSON API)
+        args: Command-line arguments
+        config: Configuration object
+
+    Returns:
+        List of dictionaries with package information
+    """
+    if args is None:
+        # Create minimal args object for logging if none provided
+        class MinimalArgs:
+            debug = False
+            query = query
+        args = MinimalArgs()
+
+    if config is None:
+        config = Config()
+
+    results = []
+    client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=30.0,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+            # "User-Agent": f"pip_search/{__version__} (https://github.com/kthordarson/pip_search)",
+            "Accept": "application/json"
+        }
+    )
+
+    try:
+        # First try: Use the PyPI XML-RPC API for search
+        # This bypasses the challenge system completely
+        if args.debug:
+            logger.debug(f"Searching for '{query}' using PyPI XML-RPC API")
+
+        import xmlrpc.client
+        with xmlrpc.client.ServerProxy('https://pypi.org/pypi') as pypi:
+            matches = pypi.search({'name': query})
+
+            if not matches and ' ' in query:
+                # Try searching with summary if name search returned nothing
+                matches = pypi.search({'summary': query})
+
+            if args.debug:
+                logger.debug(f"XML-RPC API returned {len(matches)} matches")
+
+            # Process the first batch of results (limit to reasonable number)
+            max_results = min(30, len(matches))
+            for i, result in enumerate(matches[:max_results]):
+                name = result.get('name', '')
+
+                # Get more details using the JSON API
+                try:
+                    json_url = f"https://pypi.org/pypi/{name}/json"
+                    json_resp = await client.get(json_url)
+
+                    if json_resp.status_code == 200:
+                        data = json_resp.json()
+                        info = data.get('info', {})
+                        version = info.get('version', 'unknown')
+
+                        # Get release date from releases data
+                        release_date = 'unknown'
+                        releases = data.get('releases', {})
+                        if version in releases and releases[version]:
+                            for release in releases[version]:
+                                if 'upload_time' in release:
+                                    release_date = release['upload_time']
+                                    break
+
+                        results.append({
+                            'name': name,
+                            'version': version,
+                            'description': info.get('summary', result.get('summary', '')),
+                            'released': release_date,
+                            'link': f"https://pypi.org/project/{name}/"
+                        })
+                    else:
+                        # Fallback to basic info if JSON API fails
+                        results.append({
+                            'name': name,
+                            'version': result.get('version', 'unknown'),
+                            'description': result.get('summary', ''),
+                            'released': 'unknown',
+                            'link': f"https://pypi.org/project/{name}/"
+                        })
+                except Exception as e:
+                    if args.debug:
+                        logger.debug(f"Error getting details for {name}: {e}")
+
+                    # Still add the basic info we have
+                    results.append({
+                        'name': name,
+                        'version': result.get('version', 'unknown'),
+                        'description': result.get('summary', ''),
+                        'released': 'unknown',
+                        'link': f"https://pypi.org/project/{name}/"
+                    })
+
+        # If no results from XML-RPC API, try direct package lookup
+        if not results:
+            # Try direct package lookup - might be an exact package name
+            json_url = f"https://pypi.org/pypi/{query}/json"
+            json_resp = await client.get(json_url)
+
+            if json_resp.status_code == 200:
+                data = json_resp.json()
+                info = data.get('info', {})
+                name = info.get('name', query)
+                version = info.get('version', 'unknown')
+
+                # Get release date
+                release_date = 'unknown'
+                releases = data.get('releases', {})
+                if version in releases and releases[version]:
+                    for release in releases[version]:
+                        if 'upload_time' in release:
+                            release_date = release['upload_time']
+                            break
+
+                results.append({
+                    'name': name,
+                    'version': version,
+                    'description': info.get('summary', ''),
+                    'released': release_date,
+                    'link': f"https://pypi.org/project/{name}/"
+                })
+
+                if args.debug:
+                    logger.debug(f"Found exact package match: {name}")
+
+    except Exception as e:
+        logger.error(f"Error during JSON API search: {e}")
+
+    finally:
+        await client.aclose()
+
+    return results
+
+async def old_search_with_json_api(query: str, page_count: int = 2, args: Namespace = None, config: Config = None) -> List[dict]:
+    """Search PyPI using the JSON API endpoints which are less protected by challenges.
+
+    Args:
+        query: Search query string
+        page_count: Number of pages to search (only used for XML API fallback)
+        args: Command-line arguments
+        config: Configuration object
+
+    Returns:
+        List of dictionaries with package information
+    """
+    if args is None:
+        # Create minimal args object for logging if none provided
+        class MinimalArgs:
+            debug = False
+            query = query
+        args = MinimalArgs()
+
+    if config is None:
+        config = Config()
+
+    results = []
+    client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=30.0,
+        headers={
+            "User-Agent": "pip_search/0.0.13 (+https://github.com/kthordarson/pip_search)",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+    )
+
+    try:
+        # First approach: Try PyPI's JSON API directly
+        json_api_url = f"https://pypi.org/pypi/{query}/json"
+        if args.debug:
+            logger.debug(f"Trying direct package JSON API: {json_api_url}")
+
+        response = await client.get(json_api_url)
+
+        if response.status_code == 200:
+            # Found exact package match
+            data = response.json()
+            info = data.get("info", {})
+
+            if args.debug:
+                logger.debug(f"Found exact package match: {info.get('name')}")
+
+            version = info.get("version", "unknown")
+
+            # Get release date from the latest release
+            releases = data.get("releases", {})
+            released = "unknown"
+            if version in releases and releases[version]:
+                upload_time = releases[version][0].get("upload_time")
+                if upload_time:
+                    released = upload_time
+
+            results.append({
+                "name": info.get("name", query),
+                "version": version,
+                "description": info.get("summary", ""),
+                "released": released,
+                "link": f"https://pypi.org/project/{info.get('name', query)}"
+            })
+
+        else:
+            # Second approach: Use the PyPI Simple API with XML parsing
+            simple_api_url = "https://pypi.org/simple/"
+            if args.debug:
+                logger.debug("No exact match, trying search with Simple API")
+
+            # First get the list of all packages
+            response = await client.get(simple_api_url)
+
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+
+                # Find all packages that contain our query string
+                matching_packages = []
+                for link in soup.find_all("a"):
+                    pkg_name = link.text
+                    if query.lower() in pkg_name.lower():
+                        matching_packages.append(pkg_name)
+
+                if args.debug:
+                    logger.debug(f"Found {len(matching_packages)} potential matches")
+
+                # Limit to reasonable number of results
+                matching_packages = matching_packages[:20]
+
+                # Get details for each package
+                for pkg_name in matching_packages:
+                    try:
+                        pkg_json_url = f"https://pypi.org/pypi/{pkg_name}/json"
+                        pkg_response = await client.get(pkg_json_url)
+
+                        if pkg_response.status_code == 200:
+                            pkg_data = pkg_response.json()
+                            pkg_info = pkg_data.get("info", {})
+
+                            # Get version
+                            version = pkg_info.get("version", "unknown")
+
+                            # Get release date
+                            pkg_releases = pkg_data.get("releases", {})
+                            released = "unknown"
+                            if version in pkg_releases and pkg_releases[version]:
+                                upload_time = pkg_releases[version][0].get("upload_time")
+                                if upload_time:
+                                    released = upload_time
+
+                            results.append({
+                                "name": pkg_info.get("name", pkg_name),
+                                "version": version,
+                                "description": pkg_info.get("summary", ""),
+                                "released": released,
+                                "link": f"https://pypi.org/project/{pkg_info.get('name', pkg_name)}"
+                            })
+                    except Exception as e:
+                        if args.debug:
+                            logger.debug(f"Error getting details for {pkg_name}: {e}")
+
+            # Third approach: Try xmlrpc API if we still don't have results
+            if not results:
+                if args.debug:
+                    logger.debug("No results from JSON/Simple APIs, trying XML-RPC API")
+
+                # We'll use xmlrpc to search PyPI
+                import xmlrpc.client
+
+                # This needs to be synchronous unfortunately
+                client = xmlrpc.client.ServerProxy('https://pypi.org/pypi')
+                search_results = client.search({'name': query})
+
+                for result in search_results[:20]:  # Limit results
+                    results.append({
+                        "name": result.get("name", ""),
+                        "version": result.get("version", "unknown"),
+                        "description": result.get("summary", ""),
+                        "released": "unknown",  # XML-RPC doesn't provide release dates
+                        "link": f"https://pypi.org/project/{result.get('name', '')}"
+                    })
+
+    except Exception as e:
+        logger.error(f"Error during JSON API search: {e}")
+
+    finally:
+        await client.aclose()
+
+    return results
+
+async def search_with_web_api(query: str, page_count: int = 2, args: Namespace = None, config: Config = None) -> List[dict]:
+    """Search PyPI using web API with enhanced browser emulation.
+
+    Args:
+        query: Search query string
+        page_count: Number of pages to search
+        args: Command-line arguments
+        config: Configuration object
+
+    Returns:
+        List of dictionaries with package information
+    """
+    if args is None:
+        # Create minimal args object for logging if none provided
+        class MinimalArgs:
+            debug = False
+            query = query
+        args = MinimalArgs()
+
+    if config is None:
+        config = Config()
+
+    results = []
+
+    # Create a client with very realistic browser headers
+    client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=30.0,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://pypi.org/",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        }
+    )
+
+    try:
+        # First try: Direct JSON API lookup for exact package match
+        try:
+            json_url = f"https://pypi.org/pypi/{query}/json"
+            response = await client.get(json_url)
+
+            if response.status_code == 200:
+                data = response.json()
+                info = data.get("info", {})
+                name = info.get("name", query)
+                version = info.get("version", "unknown")
+
+                # Get release date
+                release_date = "unknown"
+                releases = data.get("releases", {})
+                if version in releases and releases[version]:
+                    for release in releases[version]:
+                        if "upload_time" in release:
+                            release_date = release["upload_time"]
+                            break
+
+                results.append({
+                    "name": name,
+                    "version": version,
+                    "description": info.get("summary", ""),
+                    "released": release_date,
+                    "link": f"https://pypi.org/project/{name}/"
+                })
+
+                if args.debug:
+                    logger.debug(f"Found exact package match: {name}")
+
+                # Return early if we found an exact match
+                return results
+
+        except Exception as e:
+            if args.debug:
+                logger.debug(f"Direct JSON lookup failed: {e}")
+
+        # Second try: Use PyPI Simple API to find matching packages
+        # This API endpoint has fewer protections and can be used to find packages
+        if not results:
+            try:
+                # Initialize session by visiting the homepage first
+                await client.get("https://pypi.org/")
+                await asyncio.sleep(1)
+
+                # First try a search on the search page (this might hit challenges)
+                for page in range(1, page_count + 1):
+                    search_url = f"{config.api_url}?q={query}&page={page}"
+                    response = await client.get(search_url)
+
+                    # Check if we hit a challenge
+                    if "Client Challenge" not in response.text:
+                        # Parse search results
+                        soup = BeautifulSoup(response.text, "html.parser")
+
+                        # Look for package snippets
+                        packages = soup.select('a[class*="package-snippet"]')
+                        if not packages:
+                            packages = soup.select('[data-qa="package-snippet"]')
+                        if not packages:
+                            packages = soup.select('article[class*="package-snippet"]')
+
+                        if args.debug:
+                            logger.debug(f"Found {len(packages)} packages on page {page}")
+
+                        # Process each package
+                        for pkg in packages:
+                            try:
+                                # Extract package info from search result
+                                name_elem = pkg.select_one('span[class*="package-snippet__name"]') or pkg.select_one('[data-qa="package-name"]') or pkg.select_one('h3')
+                                desc_elem = pkg.select_one('p[class*="package-snippet__description"]') or pkg.select_one('[data-qa="package-description"]') or pkg.select_one('p')
+                                time_elem = pkg.select_one('span[class*="package-snippet__created"] time') or pkg.select_one('time') or pkg.select_one('[datetime]')
+
+                                if name_elem and desc_elem:
+                                    name = name_elem.text.strip()
+                                    description = desc_elem.text.strip()
+
+                                    href = pkg.get("href", "")
+                                    released = "unknown"
+                                    if time_elem:
+                                        released = time_elem.get("datetime") or time_elem.text.strip()
+
+                                    # Add to results
+                                    results.append({
+                                        "name": name,
+                                        "description": description,
+                                        "released": released,
+                                        "link": f"https://pypi.org{href}" if href else f"https://pypi.org/project/{name}/"
+                                    })
+                            except Exception as e:
+                                if args.debug:
+                                    logger.debug(f"Error extracting package info: {e}")
+                    else:
+                        if args.debug:
+                            logger.debug(f"Hit challenge page on search page {page}")
+            except Exception as e:
+                if args.debug:
+                    logger.debug(f"Search page approach failed: {e}")
+
+        # Third try: Use PyPI Simple API to find all packages containing the query
+        if not results:
+            try:
+                simple_url = "https://pypi.org/simple/"
+                response = await client.get(simple_url)
+
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    matching_packages = []
+
+                    # Find packages that match our query
+                    for link in soup.find_all("a"):
+                        pkg_name = link.text
+                        if query.lower() in pkg_name.lower():
+                            matching_packages.append(pkg_name)
+
+                    if args.debug:
+                        logger.debug(f"Simple API found {len(matching_packages)} potential matches")
+
+                    # Limit results to a reasonable number
+                    matching_packages = matching_packages[:20]
+
+                    # Get details for each package via JSON API
+                    for pkg_name in matching_packages:
+                        try:
+                            pkg_json_url = f"https://pypi.org/pypi/{pkg_name}/json"
+                            pkg_response = await client.get(pkg_json_url)
+
+                            if pkg_response.status_code == 200:
+                                pkg_data = pkg_response.json()
+                                pkg_info = pkg_data.get("info", {})
+
+                                # Get version
+                                version = pkg_info.get("version", "unknown")
+
+                                # Get release date
+                                released = "unknown"
+                                releases = pkg_data.get("releases", {})
+                                if version in releases and releases[version]:
+                                    for release in releases[version]:
+                                        if "upload_time" in release:
+                                            released = release["upload_time"]
+                                            break
+
+                                results.append({
+                                    "name": pkg_info.get("name", pkg_name),
+                                    "version": version,
+                                    "description": pkg_info.get("summary", ""),
+                                    "released": released,
+                                    "link": f"https://pypi.org/project/{pkg_name}/"
+                                })
+                        except Exception as e:
+                            if args.debug:
+                                logger.debug(f"Error getting details for {pkg_name}: {e}")
+            except Exception as e:
+                if args.debug:
+                    logger.debug(f"Simple API approach failed: {e}")
+
+    except Exception as e:
+        logger.error(f"Error during web API search: {e}")
+
+    finally:
+        await client.aclose()
+
+    return results
+
+async def search(args: Namespace, config: Config, opts: Union[Dict[str, Any], Namespace] = {}) -> List[Package]:
+    query = "".join(args.query)
+    try:
+        # Use the improved httpx-only search function
+        search_results = await search_pypi(query, config.page_size, args, config)
+        # search_results = await search_with_json_api(query, config.page_size, args, config)
+        # search_results = await search_with_web_api(query, config.page_size, args, config)
+
+        if args.debug:
+            logger.debug(f"Found {len(search_results)} results for query: {args.query}")
+
+        # Convert results to Package objects
+        packages = []
+        client = None
+        try:
+            # Get a session for version fetching if needed
+            client = await get_session(args, config)
+
+            for result in search_results:
+                # Get version by scraping the individual package page if needed
+                version = "unknown"
+                if result['link']:
+                    try:
+                        version = await get_version_from_link(result['link'], client)
+                    except Exception as e:
+                        if args.debug:
+                            logger.debug(f"Error fetching version for {result['name']}: {e}")
+
+                pack = Package(
+                    result['name'],
+                    version,
+                    result['released'],
+                    result['description'],
+                    result['link']
+                )
+                packages.append(pack)
+
+        finally:
+            # Always clean up the client
+            if client:
+                await client.aclose()
+
+        return packages
+
+    except Exception as e:
+        logger.error(f"Error with search: {e}")
+        return []
+
+
+async def old2search(args: Namespace, config: Config, opts: Union[Dict[str, Any], Namespace] = {}) -> List[Package]:
     """Search for packages on PyPI."""
     query = "".join(args.query)
     try:
-        playwright_results = await search_with_playwright(query, config.page_size)
+        search_results = await search(query, config.page_size, args, config)
         if args.debug:
-            logger.debug(f"[s] Playwright found: {len(playwright_results)} results for query: {args.query}")
-        # Convert playwright results to Package objects
+            logger.debug(f"[s] found: {len(search_results)} results for query: {args.query}")
         packages = []
-        for result in playwright_results:
+        for result in search_results:
             # Get version by scraping the individual package page if needed
             version = "unknown"
             if result['link']:
@@ -324,7 +1069,7 @@ async def search(
         return packages
 
     except Exception as e:
-        logger.error(f"[s] Error with Playwright search: {e} {type(e)}")
+        logger.error(f"[s] Error with search: {e} {type(e)}")
         return []
 
 async def get_repo_info(
@@ -420,11 +1165,7 @@ async def get_links(pkg_url: str, client: httpx.AsyncClient) -> Optional[Dict[st
         logger.warning(f"[err] err:{e} homepage not found pkg_url:{pkg_url}")
         return None
 
-async def get_github_info(
-    repolink: str,
-    auth: Optional[str],
-    client: httpx.AsyncClient
-) -> Optional[Dict[str, Any]]:
+async def get_github_info(repolink: str, auth: Optional[str], client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     """Get GitHub repository information for a package.
 
     Args:
