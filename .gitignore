@@ -140,3 +140,4 @@ venv.bak/
 # !.vscode/tasks.json
 .webassets-cache
 wheels/
+tmpdump
