@@ -1,3 +1,4 @@
+from playwright.async_api import async_playwright
 import asyncio
 import re
 import os
@@ -11,7 +12,7 @@ from bs4 import BeautifulSoup, Tag
 import socket
 import httpx
 from urllib3.connection import HTTPConnection
-from utils import get_session
+from utils import get_session, get_session_with_playwright
 
 HTTPConnection.default_socket_options = HTTPConnection.default_socket_options + [
     (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
@@ -103,10 +104,11 @@ async def get_snippets(
     snippets = []
     for page in range(1, config.page_size + 1):
         params = {"q": query, "page": page}
-        r = await client.get(config.api_url, params=params)
+        r = await client.get(f'{config.api_url}?q={args.query}', params=params)
         soup = BeautifulSoup(r.text, "html.parser")
         snippets += soup.select('a[class*="package-snippet"]')
-        logger.debug(f'[s] p:{page} snippets={len(snippets)} query={query} ')
+        if args.debug:
+            logger.debug(f'[s] p:{page} snippets={len(snippets)} query={query} from {config.api_url} params={params} r.status_code={r.status_code} HTML (first 500 chars): {r.text[:500]}')
     return snippets
 
 async def get_version_from_link(link: str, client: httpx.AsyncClient) -> str:
@@ -130,7 +132,7 @@ async def get_version_from_link(link: str, client: httpx.AsyncClient) -> str:
     finally:
         return version
 
-async def search(
+async def oldsearch(
     args: Namespace,
     config: Config,
     opts: Union[Dict[str, Any], Namespace] = {}
@@ -146,7 +148,8 @@ async def search(
         List of Package objects
     """
     try:
-        client = await get_session(args, config)
+        # client = await get_session(args, config)
+        client = await get_session_with_playwright(args, config)
     except Exception as e:
         logger.error(f"[s] Error creating HTTP client: {e} {type(e)}")
         return []
@@ -155,7 +158,8 @@ async def search(
     except Exception as e:
         logger.error(f"[s] Error getting snippets: {e} {type(e)}")
         return []
-
+    if args.debug:
+        logger.debug(f"[s] Snippets found: {len(snippets)} for query: {args.query}")
     auth = None
     if opts.extra:
         GITHUBAPITOKEN = os.getenv("GITHUBAPITOKEN")
@@ -193,6 +197,135 @@ async def search(
 
     await client.aclose()
     return results
+
+async def search_with_playwright(query: str, page_count: int = 2) -> List[dict]:
+    """Use Playwright to directly search and scrape results from PyPI."""
+    results = []
+    browser_args = [
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--disable-extensions',
+                    '--disable-gpu',
+                    '--disable-web-security',
+                    '--allow-running-insecure-content'
+                ]
+
+    browser_viewport = {'width': 1920, 'height': 1080},
+    browser_locale = 'en-US',
+    browser_timezone_id = 'America/New_York',
+    # Add some realistic browser features
+    browser_extra_http_headers = {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+            }
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=browser_args)
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        await context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined,
+                    });
+
+                    // Remove automation indicators
+                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+                    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+                """)
+
+        page = await context.new_page()
+
+        for page_num in range(1, page_count + 1):
+            url = f"https://pypi.org/search/?q={query}&page={page_num}"
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+                # Wait a bit for any challenges to resolve
+                await asyncio.sleep(2)
+                # Check if we got real search results
+                page_content = await page.content()
+                if "Client Challenge" not in page_content:
+                    # Look for different possible selectors for package listings
+                    packages = await page.query_selector_all('a[class*="package-snippet"]')
+                    if not packages:
+                        # Try alternative selectors
+                        packages = await page.query_selector_all('[data-qa="package-snippet"]')
+                    if not packages:
+                        packages = await page.query_selector_all('article[class*="package-snippet"]')
+                    logger.debug(f"Found {len(packages)} packages on page {page_num}")
+                    for pkg in packages:
+                        try:
+                            # Try multiple selectors for each field
+                            name_elem = await pkg.query_selector('span[class*="package-snippet__name"]') or await pkg.query_selector('[data-qa="package-name"]') or await pkg.query_selector('h3')
+                            desc_elem = await pkg.query_selector('p[class*="package-snippet__description"]') or await pkg.query_selector('[data-qa="package-description"]') or await pkg.query_selector('p')
+                            time_elem = await pkg.query_selector('span[class*="package-snippet__created"] time') or await pkg.query_selector('time') or await pkg.query_selector('[datetime]')
+
+                            if name_elem and desc_elem:
+                                name = await name_elem.text_content()
+                                description = await desc_elem.text_content()
+                                href = await pkg.get_attribute('href')
+
+                                released = None
+                                if time_elem:
+                                    released = await time_elem.get_attribute('datetime') or await time_elem.text_content()
+
+                                if name and description:
+                                    results.append({
+                                        'name': name.strip(),
+                                        'description': description.strip(),
+                                        'released': released or 'unknown',
+                                        'link': f"https://pypi.org{href}" if href else ""
+                                    })
+                        except Exception as e:
+                            logger.debug(f"Error extracting package info: {e}")
+                else:
+                    # Log some of the page content for debugging
+                    logger.debug(f"Still getting challenge page for search page {page_num} Page content preview: {page_content[:3000]}")
+
+            except Exception as e:
+                logger.error(f"Error loading search page {page_num}: {e}")
+
+        await browser.close()
+
+    return results
+
+async def search(
+    args: Namespace,
+    config: Config,
+    opts: Union[Dict[str, Any], Namespace] = {}
+) -> List[Package]:
+    """Search for packages on PyPI."""
+    query = "".join(args.query)
+    try:
+        playwright_results = await search_with_playwright(query, config.page_size)
+        if args.debug:
+            logger.debug(f"[s] Playwright found: {len(playwright_results)} results for query: {args.query}")
+        # Convert playwright results to Package objects
+        packages = []
+        for result in playwright_results:
+            # Get version by scraping the individual package page if needed
+            version = "unknown"
+            if result['link']:
+                # You could implement version fetching here if needed
+                pass
+
+            pack = Package(
+                result['name'],
+                version,
+                result['released'],
+                result['description'],
+                result['link']
+            )
+            packages.append(pack)
+
+        return packages
+
+    except Exception as e:
+        logger.error(f"[s] Error with Playwright search: {e} {type(e)}")
+        return []
 
 async def get_repo_info(
     repo: str,
